@@ -1,0 +1,93 @@
+
+
+from azure.storage.blob import BlobServiceClient
+import pandas as pd
+from io import BytesIO
+import re
+from datetime import datetime
+
+# Azure Blob Storage connection
+blob_connection_string = "DefaultEndpointsProtocol=https;AccountName=tc3sadev;AccountKey=ABC;EndpointSuffix=core.windows.net"
+container_name = "bidatafactory"
+folder_path = "Labor/Processing/"
+sheet_names = ["Data Pivot", "By store labor", "Store Labor", "DMs", "Exec Admins", "RDs", "Region Labor", "SMBAMs", "Telesales Labor"]
+
+def convert_excel_sheets_blob_to_csv(connection_string, input_container, input_blob_name,
+                                     output_container, sheet_names, output_blob_names, overwrite=True):
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+
+    try:
+        input_blob_client = blob_service_client.get_blob_client(container=input_container, blob=input_blob_name)
+        stream = BytesIO()
+        input_blob_client.download_blob().readinto(stream)
+    except Exception as e:
+        print(f"Error reading blob: {input_blob_name}")
+        raise e
+
+    stream.seek(0)
+    try:
+        excel_data = pd.read_excel(stream, sheet_name=None)
+    except Exception as e:
+        print("Error parsing Excel.")
+        raise e
+
+    for sheet, output_name in zip(sheet_names, output_blob_names):
+        if sheet not in excel_data:
+            print(f"Sheet '{sheet}' not found. Skipping.")
+            continue
+
+        df = excel_data[sheet]
+        csv_data = df.to_csv(index=False).encode("utf-8")
+
+        try:
+            output_blob_client = blob_service_client.get_blob_client(container=output_container, blob=output_name)
+            output_blob_client.upload_blob(csv_data, overwrite=overwrite)
+            print(f"Uploaded: {output_name}")
+        except Exception as e:
+            print(f"Error uploading: {output_name}")
+            raise e
+
+# Initialize client and list Excel files in the folder
+blob_service_client = BlobServiceClient.from_connection_string(blob_connection_string)
+container_client = blob_service_client.get_container_client(container_name)
+
+excel_files = [b.name for b in container_client.list_blobs(name_starts_with=folder_path) if b.name.lower().endswith(".xlsx")]
+
+# Process each file
+for input_blob_name in excel_files:
+    date_match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2})", input_blob_name)
+    if not date_match:
+        print(f"No date found in '{input_blob_name}'. Skipping.")
+        continue
+
+    mm, dd, yy = date_match.groups()
+    parsed_date = datetime.strptime(f"{mm}.{dd}.{yy}", "%m.%d.%y")
+    date_suffix = parsed_date.strftime("%Y%m01")
+    status = "Final" if "final" in input_blob_name.lower() else "Working"
+    suffix = f"_{status}_{date_suffix}"
+
+    base_path = "/".join(input_blob_name.split("/")[:-2])
+    monthly_folder = parsed_date.strftime("%Y%m")
+    output_folder = f"{base_path}/Processed/{monthly_folder}/"
+
+    output_blob_names = [
+        f"{output_folder}DataPivot{suffix}.csv",
+        f"{output_folder}ByStoreLabor{suffix}.csv",
+        f"{output_folder}StoreLabor{suffix}.csv",
+        f"{output_folder}DMLabor{suffix}.csv",
+        f"{output_folder}ExecAdminLabor{suffix}.csv",
+        f"{output_folder}RDLabor{suffix}.csv",
+        f"{output_folder}RegionLabor{suffix}.csv",
+        f"{output_folder}SBAMLabor{suffix}.csv",
+        f"{output_folder}TeleSalesLabor{suffix}.csv"
+    ]
+
+    convert_excel_sheets_blob_to_csv(
+        connection_string=blob_connection_string,
+        input_container=container_name,
+        input_blob_name=input_blob_name,
+        output_container=container_name,
+        sheet_names=sheet_names,
+        output_blob_names=output_blob_names,
+        overwrite=True
+    )
