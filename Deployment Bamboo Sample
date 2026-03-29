@@ -1,0 +1,250 @@
+DBDeploy--etl config/tepooadb/etldb
+##########################################################
+# Deploy Databases                                       #
+# Must be run within a Bamboo deploy project             #
+# Bamboo environment name must match <database>-<server> #
+##########################################################
+
+[string]$package="artifacts\$ENV:bamboo_shortPlanName.$ENV:bamboo_buildNumber.0.0.nupkg"
+[string]$project=$ENV:bamboo_deploy_project
+[string]$version=$ENV:bamboo_deploy_version
+[string]$database=($ENV:bamboo_deploy_environment).Substring(0, ($ENV:bamboo_deploy_environment).lastindexof('-'))
+[string]$server=($ENV:bamboo_deploy_environment).Substring(($ENV:bamboo_deploy_environment).lastindexof('-')+1)
+[string]$drive=Split-Path -Path $ENV:bamboo_working_directory -Qualifier
+
+if($server -like 'QA*'){
+[string]$env=$server.Substring(0,2)
+} else {
+[string]$env=$server.Substring(0,3)
+}
+
+if($server -match "AGPRQSSSQL03|RPWRQSSRPT02C"){
+$server= $server + ".ENTCORECLOUD.COM"
+}
+
+Write-host "Server: $server"
+Write-host "Database: $database"
+Write-host "Env: $env"
+
+$folder = $null,$null
+$folder[0] = "0_CORE"
+
+if($env -eq 'DEV') { $folder[1] = "1_DEV" }
+if($env -eq 'UAT') { $folder[1] = "2_UAT" }
+if($env -eq 'QA') { $folder[1] = "2_QA" }
+if($env -eq 'INT') { $folder[1] = "3_INT" }
+if($env -eq 'PER') { $folder[1] = "4_PERF" }
+if($env -eq 'STG') { $folder[1] = "5_STG" }
+if($env -eq 'AGP') { $folder[1] = "6_PROD" }
+if($env -eq 'PRD') { $folder[1] = "6_PROD" }
+if($env -eq 'CSB') { $folder[1] = "7_CSB" }
+
+
+if(Test-Path ".\artifacts\pre-release.zip"){
+"******************  Deploying pre-deploy scripts  ******************"
+$command = '"C:\Program Files\7-Zip\7z.exe" e ".\artifacts\pre-release.zip" *.sql -o".\artifacts\pre-release\" -aoa'
+$command
+Invoke-Expression "& $command"
+if(Test-Path ".\artifacts\pre-release"){
+Get-Childitem ".\artifacts\pre-release\" | Foreach {
+"Executing $_.Name on $server for $database"
+sqlcmd -E -b -S $server -d $database -i $_.FullName -f 65001
+if($LASTEXITCODE -ne 0){
+"Failed to deploy " + $_.Name
+exit 1
+}
+}
+}
+}
+
+if((Test-Path $package) -and (get-item $package).length -gt 0){
+"******************  Deploying Data Model  ******************"
+$ErrorActionPreference = "stop"
+$filter=".\cm\Filter.scpf"
+$databaseUpdateResourcesDirectory = "$drive\DatabaseUpdateResources\$project\$server\$version\$database\"
+$options = "DecryptPost2kEncryptedObjects, IgnoreDataCompression, IgnoreDatabaseAndServerName, IgnoreFileGroups, IgnoreFillFactor, IgnoreUserProperties, IgnoreWhiteSpace, IgnoreWithElementOrder, IgnoreConstraintNames, IgnoreCollations, IncludeDependencies"
+if ($database -match "dataloader|merlinra7|tepqmeops"){
+$options = $options + ", -ForceColumnOrder, IgnoreFullTextIndexing"
+}
+If (Test-Path $databaseUpdateResourcesDirectory) {
+rmdir $databaseUpdateResourcesDirectory -Recurse -Force
+}
+$dbconnection = New-DlmDatabaseConnection -ServerInstance $server -Database $database
+$cred="-E"
+
+$release = New-DlmDatabaseRelease -Source $package -Target $dbconnection -Verbose -SQLCompareOptions $options -IgnoreStaticData -IgnoreAdditional
+Export-DlmDatabaseRelease $release -Path $databaseUpdateResourcesDirectory
+Import-DlmDatabaseRelease $databaseUpdateResourcesDirectory | Use-DlmDatabaseRelease -DeployTo $dbconnection -SkipPostUpdateSchemaCheck -QueryBatchTimeout 1800
+
+"testing $ENV:bamboo_build_working_directory"
+$ENV:bamboo_build_working_directory
+$deployprojecturl= $ENV:bamboo_build_working_directory
+$deployprojecturl=$deployprojecturl.split("-")[-1]
+"id: $deployprojecturl"
+$bamboo_resultsUrl=$ENV:bamboo_resultsUrl
+"url: $bamboo_resultsUrl"
+$bamboo_resultsUrl = $bamboo_resultsUrl -replace "viewDeploymentResult.*","viewEnvironment.action?id=$deployprojecturl"
+"url: '$bamboo_resultsUrl'"
+# Log deploy info into database
+$ENV:bamboo_planRepository_name = $ENV:bamboo_planRepository_name -replace "-int\d|-dev",""
+sqlcmd -E -b -S $server -d $database -q "EXEC sp_INSERT_ModelVersion @BambooProject = '$ENV:bamboo_planKey', `
+@BambooPlan = '$ENV:bamboo_shortPlanName', @BambooPlanURL = '$bamboo_resultsUrl', @BambooBuild = '$ENV:bamboo_buildNumber', `
+@BambooRelease= '$ENV:bamboo_deploy_version', @GitRepo = '$ENV:bamboo_planRepository_name', @GitBranch = '$ENV:bamboo_planRepository_branchName', `
+@GitCommit = '$ENV:bamboo_planRepository_revision';"
+
+# Self cleanup, remove all folders that are older than 15 days
+"Running self cleanup"
+$cleanuppath="$drive\DatabaseUpdateResources\$project\$server\"
+#Get-ChildItem $cleanuppath | Where-Object {$_.LastWriteTime -lt (Get-Date).AddDays(-15)}
+#Get-ChildItem $cleanuppath | Where-Object {$_.LastWriteTime -lt (Get-Date).AddDays(-15)} | Remove-Item -Recurse -Force
+
+}
+else{
+"There is no Data Model package or package size is zero."
+}
+if(Test-Path ".\artifacts\merge.zip"){
+"******************  Deploying Merge scripts  ******************"
+$command = '"C:\Program Files\7-Zip\7z.exe" e ".\artifacts\merge.zip" *.sql -o".\artifacts\merge\" -aoa'
+$command
+Invoke-Expression "& $command"
+if(Test-Path ".\artifacts\merge"){
+Get-Childitem ".\artifacts\merge\" | Foreach {
+"Executing $_.Name on $server for $database"
+sqlcmd -E -b -S $server -d $database -i $_.FullName -f 65001
+if($LASTEXITCODE -ne 0){
+"Failed to deploy " + $_.Name
+exit 1
+}
+}
+}
+}
+
+if(Test-Path ".\artifacts\mergefolder.zip"){
+"******************  Deploying Data Insert scripts  ******************"
+$command = '"C:\Program Files\7-Zip\7z.exe" x -r ".\artifacts\mergefolder.zip" *.sql -o".\artifacts\mergefolder\" -aoa'
+Invoke-Expression "& $command"
+
+foreach ($y in $folder){
+"the folder: " + $y
+if(Test-Path ".\artifacts\mergefolder\$y"){
+Get-Childitem ".\artifacts\mergefolder\$y" | Foreach {
+"Executing $_.Name on $server for $database"
+sqlcmd -E -b -S $server -d $database -i $_.FullName -f 65001
+if($LASTEXITCODE -ne 0){
+"Failed to deploy " + $_.Name
+exit 1
+}
+}
+}
+}
+}
+
+if(Test-Path ".\artifacts\updates.zip"){
+"******************  Deploying Data Updates Monthly scripts  ******************"
+$command = '"C:\Program Files\7-Zip\7z.exe" x -r ".\artifacts\updates.zip" *.sql -o".\artifacts\updates\" -aoa'
+Invoke-Expression "& $command"
+
+foreach ($x in $folder){
+"the folder: " + $x
+if(Test-Path ".\artifacts\updates\$x"){
+Get-Childitem ".\artifacts\updates\$x" | Foreach {
+"Executing $_.Name on $server for $database"
+sqlcmd -E -b -S $server -d $database -i $_.FullName -f 65001
+if($LASTEXITCODE -ne 0){
+"Failed to deploy " + $_.Name
+exit 1
+}
+}
+}
+}
+}
+
+
+if(Test-Path ".\artifacts\post-release.zip"){
+"******************  Deploying post-deploy scripts  ******************"
+$command = '"C:\Program Files\7-Zip\7z.exe" e ".\artifacts\post-release.zip" *.sql -o".\artifacts\post-release\" -aoa'
+$command
+Invoke-Expression "& $command"
+if(Test-Path ".\artifacts\post-release"){
+Get-Childitem ".\artifacts\post-release\" | Foreach {
+"Executing $_.Name on $server for $database"
+sqlcmd -E -b -S $server -d $database -i $_.FullName -f 65001
+if($LASTEXITCODE -ne 0){
+"Failed to deploy " + $_.Name
+exit 1
+}
+}
+}
+}
+-------------------------------------------------------------
+SSIS-dep
+[string]$server=($ENV:bamboo_deploy_environment).Substring(0, ($ENV:bamboo_deploy_environment).lastindexof('-'))
+[string]$folder=($ENV:bamboo_deploy_environment).Substring(($ENV:bamboo_deploy_environment).lastindexof('-')+1)
+
+$command = '"C:\Program Files\7-Zip\7z.exe" e "artifacts\ssis.zip" -o"ssis\" -aoa'
+Invoke-Expression "& $command"
+
+[string]$theHost = hostname
+
+# Clear the destination folder first so that no stale packages remain
+if($theHost -eq "RDWUSHDBAM03C"){
+[string]$x = 'C:\"Program Files (x86)"\"Microsoft SQL Server"\150\DTS\Binn\dtutil.exe /SourceServer $server /FDirectory "SQL;$folder" /Quiet'
+$packageList = Invoke-Expression $x
+"Running on Remote Agent"
+} else {
+$packageCommand = "/SourceServer $server /FDirectory `"SQL;$folder`" /Quiet"
+$packageList = Invoke-Expression "dtutil $packageCommand"
+"Running on Bamboo Primary Server"
+}
+
+
+foreach ($ssisPackage in $packageList) {
+    if($ssisPackage -like '*(v*'){
+        $rowPattern = [Regex]::new('[A-Za-z][A-ZA-z0-9 ]{4,}')
+$match = $rowPattern.Matches($ssisPackage)
+$package = $match.Value
+
+$num=$package.length - 1
+
+$package = $package.Substring(0,$num)
+$package
+
+if($theHost -eq "RDWUSHDBAM03C"){
+[string]$xx = 'C:\"Program Files (x86)"\"Microsoft SQL Server"\150\DTS\Binn\dtutil.exe /SQL "$folder\$package" /DELETE /SourceServer $server'
+Invoke-Expression $xx
+} else {
+$command = "/SQL `"$folder\$package`" /DELETE /SourceServer $server"
+Invoke-Expression "dtutil $command"
+}
+}
+}
+# End Folder Clear
+
+
+$files=Get-Childitem "ssis\"
+foreach ($file in $files){
+$package=$file -replace '.dtsx',''
+
+if($theHost -eq "RDWUSHDBAM03C"){
+
+[string]$y = 'C:\"Program Files (x86)"\"Microsoft SQL Server"\150\DTS\Binn\dtutil.exe /FILE ".\ssis\$file" /DestServer $server /COPY "SQL;$folder\$package" /Quiet'
+$result = Invoke-Expression $y
+"package: "
+$package
+} else {
+$command = "/FILE `".\ssis\$file`" /DestServer $server /COPY `"SQL;$folder\$package`" /Quiet"
+$command
+$result = Invoke-Expression "dtutil $command"
+}
+
+    [string]$myError = $result | Select-String -Pattern 'Error'
+
+    if (([string]::IsNullOrEmpty($myError))){
+        $result
+    } else {
+        "The DTUtil command returned an error"
+        "Exiting..."
+        exit 1
+    }
+   
+}
